@@ -1,0 +1,430 @@
+{\rtf1\ansi\deff0\nouicompat{\fonttbl{\f0\fnil\fcharset0 Courier New;}}
+{\colortbl ;\red255\green255\blue0;}
+{\*\generator Riched20 10.0.17134}\viewkind4\uc1 
+\pard\f0\fs22\lang1033 import logging\par
+import argparse\par
+import time\par
+import os\par
+import pickle\par
+import numpy as np\par
+from logger import Logger\par
+import sys\par
+from collections import OrderedDict\par
+from tensorboardX import SummaryWriter      \par
+\par
+import torch\par
+import torch.nn as nn\par
+from torch.utils.data import Dataset, DataLoader\par
+from torch.optim.lr_scheduler import ReduceLROnPlateau\par
+\par
+from network.rtpose_vgg import get_model, use_vgg\par
+\par
+#####################################\par
+#               DATASET             #\par
+#####################################\par
+class Pose_Dataset(Dataset):\par
+    \highlight1 def __init__(self, data_dir, num_im):\par
+\highlight0         super(Pose_Dataset, self).__init__()\par
+        data_files = os.listdir(data_dir)\par
+        self.data_paths = [os.path.join(data_dir, d) for d in data_files]\par
+        \highlight1 self.data_paths = self.data_paths[0:num_im]\par
+\highlight0\par
+    def __len__(self):\par
+        return len(self.data_paths)\par
+\par
+    def __getitem__(self, index):\par
+        with open(self.data_paths[index], 'rb') as f:\par
+            sample = pickle.load(f)\par
+        return sample\par
+\par
+logger = Logger('./logs')\par
+#sys.argv=['']; \par
+#del sys\par
+\par
+# Hyper-params\par
+parser = argparse.ArgumentParser(description='PyTorch rtpose Training')\par
+\par
+s = '/scratch/aek495/pyenv2/pytorch_Pose/'\par
+parser.add_argument('--data_dir', default=s+'training/dataset/COCO/images/', type=str, metavar='DIR',\par
+                    help='path to where coco images stored') \par
+parser.add_argument('--preproc_dir', default=s+'training/dataset/COCO/preprocess', type=str, metavar='DIR',\par
+                    help='path to where coco images preprocessed') \par
+parser.add_argument('--valid_dir', default=s+'training/dataset/COCO/preprocess/valid', type=str, metavar='DIR',\par
+                    help='path to preprocessed valid images') \par
+parser.add_argument('--train_dir', default=s+'training/dataset/COCO/preprocess/train', type=str, metavar='DIR',\par
+                    help='path to preprocessed train images') \par
+parser.add_argument('--mask_dir', default=s+'training/dataset/COCO/mask/', type=str, metavar='DIR',\par
+                    help='path to where coco images stored')    \par
+parser.add_argument('--logdir', default=s+'logs/', type=str, metavar='DIR',\par
+                    help='path to where tensorboard log restore')                                       \par
+parser.add_argument('--json_path', default=s+'training/dataset/COCO/COCO.json', type=str, metavar='PATH',\par
+                    help='path to where coco images stored')                                      \par
+parser.add_argument('--model_path', default=s+'network/weight/', type=str, metavar='DIR',\par
+                    help='path to where the model saved')                     \par
+parser.add_argument('--lr', '--learning-rate', default=1., type=float,\par
+                    metavar='LR', help='initial learning rate')\par
+\par
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',\par
+                    help='momentum')\par
+ \par
+\highlight1 parser.add_argument('--num_train', default=50, type=int, metavar='NT',\par
+                    help='number of training images')\par
+\par
+parser.add_argument('--num_valid', default=10, type=int, metavar='NV',\par
+                    help='number of validation images')\par
+\highlight0\par
+parser.add_argument('--epochs', default=200, type=int, metavar='N',\par
+                    help='number of total epochs to run')\par
+                    \par
+parser.add_argument('--weight-decay', '--wd', default=0.000, type=float,\par
+                    metavar='W', help='weight decay (default: 1e-4)')  \par
+parser.add_argument('--nesterov', dest='nesterov', action='store_true')     \par
+                                                   \par
+parser.add_argument('-o', '--optim', default='sgd', type=str)\par
+#Device options\par
+parser.add_argument('--gpu_ids', dest='gpu_ids', help='which gpu to use', nargs="+",\par
+                    default=[0,1,2,3], type=int)\par
+                    \par
+parser.add_argument('--batch_size', default=80, type=int,\par
+                    metavar='N', help='mini-batch size (default: 256)')\par
+\par
+parser.add_argument('--print_freq', default=20, type=int, metavar='N',\par
+                    help='number of iterations to print the training statistics')\par
+args = parser.parse_args()  \par
+               \par
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(e) for e in args.gpu_ids)\par
+\par
+params_transform = dict()\par
+params_transform['mode'] = 5\par
+# === aug_scale ===\par
+params_transform['scale_min'] = 0.5\par
+params_transform['scale_max'] = 1.1\par
+params_transform['scale_prob'] = 1\par
+params_transform['target_dist'] = 0.6\par
+# === aug_rotate ===\par
+params_transform['max_rotate_degree'] = 40\par
+\par
+# ===\par
+params_transform['center_perterb_max'] = 40\par
+\par
+# === aug_flip ===\par
+params_transform['flip_prob'] = 0.5\par
+\par
+params_transform['np'] = 56\par
+params_transform['sigma'] = 7.0\par
+params_transform['limb_width'] = 1.\par
+\par
+def build_names():\par
+    names = []\par
+\par
+    for j in range(1, 7):\par
+        for k in range(1, 3):\par
+            names.append('loss_stage%d_L%d' % (j, k))\par
+    return names\par
+\par
+\par
+def get_loss(saved_for_loss, heat_temp, heat_weight,\par
+               vec_temp, vec_weight):\par
+\par
+    names = build_names()\par
+    saved_for_log = OrderedDict()\par
+    criterion = nn.MSELoss(size_average=True).cuda()\par
+    #criterion = encoding.nn.DataParallelCriterion(criterion, device_ids=args.gpu_ids)\par
+    total_loss = 0\par
+\par
+    for j in range(6):\par
+        pred1 = saved_for_loss[2 * j] * vec_weight\par
+        """\par
+        print("pred1 sizes")\par
+        print(saved_for_loss[2*j].data.size())\par
+        print(vec_weight.data.size())\par
+        print(vec_temp.data.size())\par
+        """\par
+        gt1 = vec_temp * vec_weight\par
+\par
+        pred2 = saved_for_loss[2 * j + 1] * heat_weight\par
+        gt2 = heat_weight * heat_temp\par
+        """\par
+        print("pred2 sizes")\par
+        print(saved_for_loss[2*j+1].data.size())\par
+        print(heat_weight.data.size())\par
+        print(heat_temp.data.size())\par
+        """\par
+\par
+        # Compute losses\par
+        loss1 = criterion(pred1, gt1) * 0\par
+       # if j == 0:\par
+        loss2 = criterion(pred2, gt2) \par
+        #else:\par
+         #   loss2 = criterion(pred2, gt2) * 0\par
+\par
+        total_loss += loss1\par
+        total_loss += loss2\par
+        # print(total_loss)\par
+\par
+        # Get value from Variable and save for log\par
+        saved_for_log[names[2 * j]] = loss1.item()\par
+        saved_for_log[names[2 * j + 1]] = loss2.item()\par
+\par
+    saved_for_log['max_ht'] = torch.max(\par
+        saved_for_loss[-1].data[:, 0:-1, :, :]).item()\par
+    saved_for_log['min_ht'] = torch.min(\par
+        saved_for_loss[-1].data[:, 0:-1, :, :]).item()\par
+    saved_for_log['max_paf'] = torch.max(saved_for_loss[-2].data).item()\par
+    saved_for_log['min_paf'] = torch.min(saved_for_loss[-2].data).item()\par
+\par
+    return total_loss, saved_for_log\par
+         \par
+\par
+def train(train_loader, model, optimizer, epoch):\par
+    batch_time = AverageMeter()\par
+    data_time = AverageMeter()\par
+    losses = AverageMeter()\par
+    \par
+    meter_dict = \{\}\par
+    for name in build_names():\par
+        meter_dict[name] = AverageMeter()\par
+    meter_dict['max_ht'] = AverageMeter()\par
+    meter_dict['min_ht'] = AverageMeter()    \par
+    meter_dict['max_paf'] = AverageMeter()    \par
+    meter_dict['min_paf'] = AverageMeter()\par
+    \par
+    \par
+    # switch to train mode\par
+    model.train()\par
+\par
+    end = time.time()\par
+    print("training")\par
+    nb_found = 0\par
+    for i, (img, heatmap_target, heat_mask, paf_target, paf_mask) in enumerate(train_loader):\par
+        #print(img.size())\par
+        if type(img[0]) == 'str':\tab\par
+        #    print('in here')\par
+            continue\par
+        else:\par
+            nb_found += 1\par
+         #   print(nb_found, i)\par
+        # measure data loading time\par
+        #writer.add_text('Text', 'text logged at step:' + str(i), i)\par
+        \par
+        #for name, param in model.named_parameters():\par
+        #  writer.add_histogram(name, param.clone().cpu().data.numpy(),i)        \par
+        data_time.update(time.time() - end)\par
+\par
+        img = img.squeeze(1).cuda()\par
+        heatmap_target = heatmap_target.squeeze(1).cuda()\par
+        heat_mask = heat_mask.squeeze(1).cuda()\par
+        paf_target = paf_target.squeeze(1).cuda()\par
+        paf_mask = paf_mask.squeeze(1).cuda()\par
+        \par
+        #img = img.squeeze(1)\par
+        #heatmap_target = heatmap_target.squeeze(1)\par
+        #heat_mask = heat_mask.squeeze(1)\par
+        #paf_target = paf_target.squeeze(1)\par
+        #paf_mask = paf_mask.squeeze(1)\par
+        \par
+        # compute output\par
+        _,saved_for_loss = model(img)\par
+        \par
+        total_loss, saved_for_log = get_loss(saved_for_loss, heatmap_target, heat_mask,\par
+               paf_target, paf_mask)\par
+        \par
+        for name,_ in meter_dict.items():\par
+            meter_dict[name].update(saved_for_log[name], img.size(0))\par
+        losses.update(total_loss, img.size(0))\par
+\par
+        # compute gradient and do SGD step\par
+        optimizer.zero_grad()\par
+        total_loss.backward()\par
+        optimizer.step()\par
+\par
+        # measure elapsed time\par
+        batch_time.update(time.time() - end)\par
+        end = time.time()\par
+\par
+        #print('epoch= '+str(epoch))\par
+        #print('dataset length = ' + str(len(train_dataset))+ ' batch size = '+str(args.batch_size))\par
+        step = epoch*len(train_dataset)/args.batch_size + i\par
+        #print(step)\par
+        logger.scalar_summary('train_loss',losses.avg,step)\par
+\par
+        #if i % args.print_freq == 0:\par
+         #   logging.info('Epoch: [\{0\}][\{1\}/\{2\}]'.format(epoch, i, len(train_loader)))\par
+          #  logging.info('Data time \{data_time.val:.3f\} (\{data_time.avg:.3f\})'.format( data_time=data_time))\par
+           # logging.info('Loss \{loss.val:.4f\} (\{loss.avg:.4f\})'.format(loss=losses))\par
+\par
+            #print_string = ''\par
+            #for name, value in meter_dict.items():\par
+             #   print_string+='\{name\}: \{loss.val:.4f\} (\{loss.avg:.4f\})\\t'.format(name=name, loss=value)\par
+            #print(print_string)\par
+    return losses.avg  \par
+        \par
+def validate(val_loader, model, epoch):\par
+    batch_time = AverageMeter()\par
+    data_time = AverageMeter()\par
+    losses = AverageMeter()\par
+    \par
+    meter_dict = \{\}\par
+    for name in build_names():\par
+        meter_dict[name] = AverageMeter()\par
+    meter_dict['max_ht'] = AverageMeter()\par
+    meter_dict['min_ht'] = AverageMeter()    \par
+    meter_dict['max_paf'] = AverageMeter()    \par
+    meter_dict['min_paf'] = AverageMeter()\par
+    # switch to train mode\par
+    model.eval()\par
+\par
+    nb_found = 0\par
+    end = time.time()\par
+    print('validating')\par
+    for i, (img, heatmap_target, heat_mask, paf_target, paf_mask) in enumerate(val_loader):\par
+        #print(img.size())\par
+        if type(img[0]) == 'str':\par
+            continue\par
+        else:\par
+            nb_found += 1\par
+          #  print(nb_found, i)\par
+        # measure data loading time\par
+        data_time.update(time.time() - end)\par
+\par
+        img = img.squeeze(1).cuda()\par
+        heatmap_target = heatmap_target.squeeze(1).cuda()\par
+        heat_mask = heat_mask.squeeze(1).cuda()\par
+        paf_target = paf_target.squeeze(1).cuda()\par
+        paf_mask = paf_mask.squeeze(1).cuda()\par
+        \par
+        # compute output\par
+        _,saved_for_loss = model(img)\par
+        \par
+        total_loss, saved_for_log = get_loss(saved_for_loss, heatmap_target, heat_mask,\par
+               paf_target, paf_mask)\par
+               \par
+        for name,_ in meter_dict.items():\par
+            meter_dict[name].update(saved_for_log[name], img.size(0))\par
+            \par
+        losses.update(total_loss.item(), img.size(0))\par
+\par
+        # measure elapsed time\par
+        batch_time.update(time.time() - end)\par
+        end = time.time()  \par
+        #if i % args.print_freq == 0:\par
+         #   logging.info('Epoch: [\{0\}][\{1\}/\{2\}]'.format(epoch, i, len(val_loader)))\par
+          #  logging.info('Data time \{data_time.val:.3f\} (\{data_time.avg:.3f\})'.format(data_time=data_time))\par
+           # logging.info('Loss \{loss.val:.4f\} (\{loss.avg:.4f\})'.format(loss=losses))\par
+\par
+            #print_string = ''\par
+            #for name, value in meter_dict.items():\par
+             #   print_string+='\{name\}: \{loss.val:.4f\} (\{loss.avg:.4f\})\\t'.format(name=name, loss=value)\par
+            #print(print_string)\par
+                \par
+    return losses.avg\par
+\par
+class AverageMeter(object):\par
+    """Computes and stores the average and current value"""\par
+    def __init__(self):\par
+        self.reset()\par
+\par
+    def reset(self):\par
+        self.val = 0\par
+        self.avg = 0\par
+        self.sum = 0\par
+        self.count = 0\par
+\par
+    def update(self, val, n=1):\par
+        self.val = val\par
+        self.sum += val * n\par
+        self.count += n\par
+        self.avg = self.sum / self.count\par
+\par
+\par
+print("Loading dataset...")\par
+# load data\par
+# TODO update data loaders\par
+\highlight1 valid_dataset = Pose_Dataset(args.valid_dir, args.num_valid)\par
+train_dataset = Pose_Dataset(args.train_dir, args.num_train)\par
+\highlight0 valid_loader = DataLoader(valid_dataset,\par
+                          batch_size=args.batch_size,\par
+                          num_workers=0)\par
+train_loader = DataLoader(train_dataset,\par
+                          batch_size=args.batch_size,\par
+                          shuffle=True,\par
+                          num_workers=0)\par
+print("\{:6d\} train samples".format(len(train_dataset)))\par
+print("\{:6d\} valid samples".format(len(valid_dataset)))\par
+\par
+# model\par
+model = get_model(trunk='vgg19')\par
+#model = encoding.nn.DataParallelModel(model, device_ids=args.gpu_ids)\par
+#model = torch.nn.DataParallel(model)\par
+model = torch.nn.DataParallel(model).cuda()\par
+# load pretrained\par
+use_vgg(model, args.model_path, 'vgg19')\par
+\par
+\par
+# Fix the VGG weights first, and then the weights will be released\par
+for i in range(20):\par
+    for param in model.module.model0[i].parameters():\par
+        param.requires_grad = False\par
+\par
+trainable_vars = [param for param in model.parameters() if param.requires_grad]\par
+optimizer = torch.optim.SGD(trainable_vars, lr=args.lr,\par
+                           momentum=args.momentum,\par
+                           weight_decay=args.weight_decay,\par
+                           nesterov=args.nesterov)\par
+ \par
+print("Beginning training.")\par
+print("WARNING: only non-zero loss is stage 1, branch 2")\par
+start_time = time.time()\par
+for epoch in range(5):\par
+    logging.info("Epoch \{\}".format(epoch))\par
+    # train for one epoch\par
+    train_loss = train(train_loader, model, optimizer, epoch)\par
+   \par
+    # evaluate on validation set\par
+    val_loss = validate(valid_loader, model, epoch)  \par
+    logger.scalar_summary('Val_loss',val_loss,epoch) \par
+    t = (time.time()-start_time)/60.0\par
+    print('Epoch '+str(epoch)+' took '+str(t)+ ' minutes ---')\par
+    logging.info("Train loss: \{:.6f\}".format(train_loss))\par
+    logging.info("Valid loss: \{:.6f\}".format(val_loss))\par
+                                 \par
+# Release all weights                                   \par
+for param in model.module.parameters():\par
+    param.requires_grad = True\par
+\par
+trainable_vars = [param for param in model.parameters() if param.requires_grad]\par
+optimizer = torch.optim.SGD(trainable_vars, lr=args.lr,\par
+                           momentum=args.momentum,\par
+                           weight_decay=args.weight_decay,\par
+                           nesterov=args.nesterov)          \par
+                                                    \par
+lr_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=5, verbose=True, threshold=0.0001, threshold_mode='rel', cooldown=3, min_lr=0, eps=1e-08)\par
+\par
+best_val_loss = np.inf\par
+\par
+\par
+model_save_filename = './network/weight/best_pose_test.pth'\par
+for epoch in range(5, args.epochs):\par
+\par
+    # train for one epoch\par
+    train_loss = train(train_loader, model, optimizer, epoch)\par
+\par
+    # evaluate on validation set\par
+    val_loss = validate(valid_loader, model, epoch)   \par
+    t = (time.time()-start_time)/60.0\par
+    print('Epoch '+str(epoch)+' took '+str(t)+ ' minutes ---')\par
+\par
+    logger.scalar_summary('Val_loss',val_loss,epoch) \par
+    logging.info("Train loss: \{:.6f\}".format(train_loss))\par
+    logging.info("Valid loss: \{:.6f\}".format(val_loss))\par
+\par
+    lr_scheduler.step(val_loss)                        \par
+    \par
+    is_best = val_loss<best_val_loss\par
+    best_val_loss = min(val_loss, best_val_loss)\par
+    if is_best:\par
+        torch.save(model.state_dict(), model_save_filename)      \par
+        \par
+\par
+}
+ 
