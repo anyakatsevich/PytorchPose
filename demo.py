@@ -25,14 +25,13 @@ from evaluate.coco_eval import get_multiplier, get_outputs, handle_paf_and_heat
 
 
 weight_name = './network/weight/best_pose.pth'
-
-
-model = get_model('vgg19')     
-model.load_state_dict(torch.load(weight_name))
+state_dict = torch.load(weight_name)
+model = get_model(trunk='vgg19')
 model = torch.nn.DataParallel(model).cuda()
-model.float()
+model.load_state_dict(state_dict)
 model.eval()
-
+model.float()
+model = model.cuda()
 
 
 print('got here')
